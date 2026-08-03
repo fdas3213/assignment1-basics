@@ -127,24 +127,7 @@ class SwiGLU(nn.Module):
         return torch.matmul(torch.mul(first_term, second_term), self.W2.T)
 
 
-
 # ROPE
-def rotate_angle(theta: float, d_k: int, max_seq_len: int) -> torch.Tensor:
-    # theta ^ (-2i/d_k) for i = 0, 1, ..., d_k/2-1
-    i = torch.arange(0, d_k // 2, dtype=torch.float32)
-    frequencies = theta ** (-2 * i / d_k)
-
-    positions = torch.arange(max_seq_len, dtype=torch.float32)
-    return torch.outer(positions, frequencies)  # shape: (max_seq_len, d_k // 2)
-
-
-def get_rotary_embedding(theta: float, d_k: int, max_seq_len: int):
-    angles = rotate_angle(theta, d_k, max_seq_len)
-    cos = torch.repeat_interleave(torch.cos(angles), 2, dim=-1)
-    sin = torch.repeat_interleave(torch.sin(angles), 2, dim=-1)
-    return cos, sin
-
-
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     """
     Rotate the last dimension of x by swapping and negating pairs of elements
@@ -175,8 +158,17 @@ class ROPE(nn.Module):
         self.max_seq_len = max_seq_len
 
         assert d_k % 2 == 0, "d_k must be even for RoPE"
+
+        # rotation matrix
+        i = torch.arange(0, d_k//2, dtype=torch.float32)
+        frequencies = theta ** (-2*i/d_k)
+        positions = torch.arange(0, max_seq_len, dtype=torch.float32)
+        angles = torch.outer(positions, frequencies) # shape: (max_seq_len, d_k // 2)
+
+        # get cos and sin
+        cos = torch.repeat_interleave(torch.cos(angles), 2, dim=-1)
+        sin = torch.repeat_interleave(torch.sin(angles), 2, dim=-1)
         
-        cos, sin = get_rotary_embedding(theta=theta, d_k=d_k, max_seq_len=max_seq_len)
         self.register_buffer("cos_cached", cos)
         self.register_buffer("sin_cached", sin)
 
@@ -186,10 +178,94 @@ class ROPE(nn.Module):
         return apply_rotary_pos_emb(x, cos, sin)
 
 
-if __name__ == "__main__":
-    d_k = 64
-    max_seq_len = 512
-    angles = rotate_angle(10000.0, d_k, max_seq_len)
-    x = torch.rand(2, 6)
-    print(x)
-    print(get_half_seq(x))
+def softmax(x: torch.Tensor, i: int):
+    # Subtract maximum for numerical stability. keepdim=True for broadcasting
+    max_val = torch.max(x, dim=i, keepdim=True).values
+    normalized = x - max_val
+    # Apply exponent
+    exp_vals = torch.exp(normalized)
+    sum_exp = torch.sum(exp_vals, dim=i, keepdim=True)
+    return exp_vals / sum_exp
+
+
+def SDPA(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    # Get the scaling factor
+    d_k = Q.size(-1)
+
+    # Calculate raw attention scores Q * K^T / sqrt(d_k)
+    # Use transpose(-2, -1) to handle batched inputs safely
+    scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_k)
+
+    # Apply masking
+    if mask is not None:
+        scores = scores.masked_fill(~mask, float("-inf"))
+
+    # Apply softmax
+    softmax_output = softmax(scores, -1)
+    return torch.matmul(softmax_output, V)
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self,
+                 d_model: int,
+                 num_heads: int,
+                 device: torch.device | None=None,
+                 dtype: torch.dtype | None=None,
+                 rope: bool = False,
+                 theta: float | None = None,
+                 max_seq_len: int | None = None,
+                 token_positions: torch.Tensor | None = None,
+    ):
+        super().__init__()
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.rope = rope
+        self.theta = theta
+        self.max_seq_len = max_seq_len
+        self.token_positions = token_positions
+
+        self.W_Q = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.W_K = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.W_V = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.W_O = Linear(d_model, d_model, device=device, dtype=dtype)
+
+    def forward(self, x):
+        # create a causal mask during forward mask dynamically based on input seq length
+        B, S, _ = x.size()
+        causal_mask = torch.tril(torch.ones((S, S), dtype=torch.bool))
+
+        # linear projection: x @ W. shape: (B, S, d_model)
+        Q = self.W_Q(x)
+        K = self.W_K(x)
+        V = self.W_V(x)
+
+        # split heads
+        # view as (B, S, num_heads, d_k), then transpose to (B, H, S, d_k)
+        Q = Q.view(B, S, self.num_heads, self.d_k).transpose(1, 2)
+        K = K.view(B, S, self.num_heads, self.d_k).transpose(1, 2)
+        V = V.view(B, S, self.num_heads, self.d_k).transpose(1, 2)
+
+        if self.rope:
+            if not self.theta or not self.max_seq_len:
+                raise ValueError("theta and max_seq_len must be provided when applying ROPE")
+            rope_emb = ROPE(self.theta, self.d_k, S)
+            Q = rope_emb(Q, self.token_positions)
+            K = rope_emb(K, self.token_positions)
+
+        # SDPA output shape: (B, num_heads, S, d_k)
+        attention_output = SDPA(Q, K, V, mask=causal_mask)
+
+        # concat head
+        attention_output = attention_output.transpose(1, 2).contiguous().view(B, S, self.d_model)
+        return self.W_O(attention_output)
+
+
+# if __name__ == "__main__":
+#     d_k = 64
+#     max_seq_len = 512
+#     angles = rotate_angle(10000.0, d_k, max_seq_len)
+#     x = torch.rand(2, 6)
+#     print(x)
+#     print(get_half_seq(x))
