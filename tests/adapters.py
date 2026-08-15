@@ -207,10 +207,9 @@ def run_multihead_self_attention_with_rope(
     multihead_attention = MultiHeadAttention(
         d_model=d_model,
         num_heads=num_heads,
-        theta=theta,
         rope=True,
+        theta=theta,
         max_seq_len=max_seq_len,
-        token_positions=token_positions,
     )
     multihead_attention.load_state_dict(
         {
@@ -220,7 +219,7 @@ def run_multihead_self_attention_with_rope(
             "W_O.W": o_proj_weight,
         }
     )
-    return multihead_attention(in_features)
+    return multihead_attention(in_features, token_positions)
 
 
 def run_rope(
@@ -317,7 +316,27 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    transformer = TransformerBlock(
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        max_seq_len=max_seq_len,
+        theta=theta,
+    )
+    custom_weights = {
+        "multihead_attention.W_Q.W": weights["attn.q_proj.weight"],
+        "multihead_attention.W_K.W": weights["attn.k_proj.weight"],
+        "multihead_attention.W_V.W": weights["attn.v_proj.weight"],
+        "multihead_attention.W_O.W": weights["attn.output_proj.weight"],
+        "layer_norm_1.g": weights["ln1.weight"],
+        "layer_norm_2.g": weights["ln2.weight"],
+        "swiglu.W1": weights["ffn.w1.weight"],
+        "swiglu.W2": weights["ffn.w2.weight"],
+        "swiglu.W3": weights["ffn.w3.weight"],
+
+    }
+    transformer.load_state_dict(custom_weights)
+    return transformer(in_features)
 
 
 def run_transformer_lm(
@@ -399,7 +418,33 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    transformer = TransformerLM(
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        vocab_size=vocab_size,
+        context_length=context_length,
+        num_layers=num_layers,
+        rope_theta=rope_theta
+    )
+    custom_weights = {
+        "emb.emb": weights["token_embeddings.weight"],
+        "rmsnorm.g": weights["ln_final.weight"],
+        "linear.W": weights["lm_head.weight"],
+    }
+    for n in range(num_layers):
+        custom_weights[f"transformer_blocks.{n}.multihead_attention.W_Q.W"] = weights[f"layers.{n}.attn.q_proj.weight"]
+        custom_weights[f"transformer_blocks.{n}.multihead_attention.W_K.W"] = weights[f"layers.{n}.attn.k_proj.weight"]
+        custom_weights[f"transformer_blocks.{n}.multihead_attention.W_V.W"] = weights[f"layers.{n}.attn.v_proj.weight"]
+        custom_weights[f"transformer_blocks.{n}.multihead_attention.W_O.W"] = weights[f"layers.{n}.attn.output_proj.weight"]
+        custom_weights[f"transformer_blocks.{n}.layer_norm_1.g"] = weights[f"layers.{n}.ln1.weight"]
+        custom_weights[f"transformer_blocks.{n}.layer_norm_2.g"] = weights[f"layers.{n}.ln2.weight"]
+        custom_weights[f"transformer_blocks.{n}.swiglu.W1"] = weights[f"layers.{n}.ffn.w1.weight"]
+        custom_weights[f"transformer_blocks.{n}.swiglu.W2"] = weights[f"layers.{n}.ffn.w2.weight"]
+        custom_weights[f"transformer_blocks.{n}.swiglu.W3"] = weights[f"layers.{n}.ffn.w3.weight"]
+    transformer.load_state_dict(custom_weights)
+    return transformer(in_indices)
+    
 
 
 def run_rmsnorm(
@@ -496,7 +541,7 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    return cross_entropy_loss(inputs, targets)
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -515,7 +560,7 @@ def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(

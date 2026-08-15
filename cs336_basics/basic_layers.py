@@ -1,7 +1,10 @@
+from collections.abc import Callable, Iterable
+from typing import Optional
 import numpy as np
 import math
 import torch
 import torch.nn as nn
+import matplotlib.pyplot as plt
 
 
 class Linear(nn.Module):
@@ -127,23 +130,6 @@ class SwiGLU(nn.Module):
         return torch.matmul(torch.mul(first_term, second_term), self.W2.T)
 
 
-# ROPE
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """
-    Rotate the last dimension of x by swapping and negating pairs of elements
-    (x1, x2) -> (-x2, x1)
-    """
-    x1 = x[..., ::2]  # even indices (0, 2, 4, ...)
-    x2 = x[..., 1::2]  # odd indices (1, 3, 5, ...)
-    # interleave -x2 and x1
-    rotated = torch.stack((-x2, x1), dim=-1)  # shape (..., d_k // 2, 2)
-    return rotated.flatten(start_dim=-2)
-
-
-def apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin:torch.Tensor) -> torch.Tensor:
-    return x * cos + rotate_half(x) * sin
-
-
 class ROPE(nn.Module):
     def __init__(
         self,
@@ -169,13 +155,28 @@ class ROPE(nn.Module):
         cos = torch.repeat_interleave(torch.cos(angles), 2, dim=-1)
         sin = torch.repeat_interleave(torch.sin(angles), 2, dim=-1)
         
-        self.register_buffer("cos_cached", cos)
-        self.register_buffer("sin_cached", sin)
+        self.register_buffer("cos_cached", cos, persistent=False)
+        self.register_buffer("sin_cached", sin, persistent=False)
+
+    def _rotate_half(self, x):
+        """
+        Rotate the last dimension of x by swapping and negating pairs of elements
+        For RoPE, we rotate pairs of dimensions: (x1, x2) -> (-x2, x1)
+        """
+        # split into halves
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        # interleave
+        rotated = torch.stack((-x2, x1), dim=-1)  # shape (..., d_k // 2, 2)
+        return rotated.flatten(start_dim=-2)
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
-        cos = self.cos_cached[token_positions, ...]
-        sin = self.sin_cached[token_positions, ...]
-        return apply_rotary_pos_emb(x, cos, sin)
+        cos = self.cos_cached[token_positions]
+        sin = self.sin_cached[token_positions]
+
+        # Apply RoPE: x * cos + rotate(half) * sin
+        rotated_x = self._rotate_half(x)
+        return x * cos + rotated_x * sin
 
 
 def softmax(x: torch.Tensor, i: int):
@@ -214,7 +215,6 @@ class MultiHeadAttention(nn.Module):
                  rope: bool = False,
                  theta: float | None = None,
                  max_seq_len: int | None = None,
-                 token_positions: torch.Tensor | None = None,
     ):
         super().__init__()
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
@@ -224,14 +224,18 @@ class MultiHeadAttention(nn.Module):
         self.rope = rope
         self.theta = theta
         self.max_seq_len = max_seq_len
-        self.token_positions = token_positions
 
         self.W_Q = Linear(d_model, d_model, device=device, dtype=dtype)
         self.W_K = Linear(d_model, d_model, device=device, dtype=dtype)
         self.W_V = Linear(d_model, d_model, device=device, dtype=dtype)
         self.W_O = Linear(d_model, d_model, device=device, dtype=dtype)
 
-    def forward(self, x):
+        if self.rope:
+            if not theta or not max_seq_len:
+                raise ValueError("theta and max_seq_len must be provided when applying RoPE")
+            self.rope_emb = ROPE(theta, self.d_k, max_seq_len)
+
+    def forward(self, x, token_positions: torch.Tensor = None):
         # create a causal mask during forward mask dynamically based on input seq length
         B, S, _ = x.size()
         causal_mask = torch.tril(torch.ones((S, S), dtype=torch.bool))
@@ -248,11 +252,11 @@ class MultiHeadAttention(nn.Module):
         V = V.view(B, S, self.num_heads, self.d_k).transpose(1, 2)
 
         if self.rope:
-            if not self.theta or not self.max_seq_len:
-                raise ValueError("theta and max_seq_len must be provided when applying ROPE")
-            rope_emb = ROPE(self.theta, self.d_k, S)
-            Q = rope_emb(Q, self.token_positions)
-            K = rope_emb(K, self.token_positions)
+            # default positions
+            if token_positions is None:
+                token_positions = torch.arange(S, device=x.device)
+            Q = self.rope_emb(Q, token_positions)
+            K = self.rope_emb(K, token_positions)
 
         # SDPA output shape: (B, num_heads, S, d_k)
         attention_output = SDPA(Q, K, V, mask=causal_mask)
@@ -261,11 +265,190 @@ class MultiHeadAttention(nn.Module):
         attention_output = attention_output.transpose(1, 2).contiguous().view(B, S, self.d_model)
         return self.W_O(attention_output)
 
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        max_seq_len: int,
+        theta: float,
+    ):
+        super().__init__()
+
+        # initialize layers
+        self.layer_norm_1 = RMSNorm(d_model=d_model)
+        self.layer_norm_2 = RMSNorm(d_model=d_model)
+        self.multihead_attention = MultiHeadAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            rope=True,
+            theta=theta,
+            max_seq_len=max_seq_len,
+        )
+        self.swiglu = SwiGLU(d_model=d_model, d_ff=d_ff)
+
+    def forward(self, x, token_positions: torch.Tensor = None):
+        # RMSNorm -> Multi-head self attention -> residual connection
+        layer_norm_output = self.layer_norm_1(x)
+        multihead_attention_output = self.multihead_attention(layer_norm_output, token_positions=token_positions)
+        residual_connection_output = multihead_attention_output + x
+
+        # Position wise feedforward network: RMSNorm -> SwiGLU -> residual connection
+        layer_norm_output_2 = self.layer_norm_2(residual_connection_output)
+        feedforward_network_output = self.swiglu(layer_norm_output_2)
+        return feedforward_network_output + residual_connection_output
+
+
+class TransformerLM(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float,
+    ):
+        super().__init__()
+
+        self.num_layers = num_layers
+        # initialize layers
+        # token embedding
+        self.emb = Embedding(vocab_size, d_model)
+
+        # transformer blocks
+        self.transformer_blocks = nn.ModuleList(
+            [
+                TransformerBlock(d_model, num_heads, d_ff, context_length, rope_theta) for _ in range(num_layers)
+            ]
+        )
+        # last layer norm
+        self.rmsnorm = RMSNorm(d_model=d_model)
+        # linear projection
+        self.linear = Linear(d_model, vocab_size)
+
+    def forward(self, x, token_positions: torch.Tensor = None):
+        B, S = x.shape
+        # Generate token positions for RoPE
+        # unsqueeze(0): add a new dimension at index 0 so [4] -> [1,4]
+        # expand(B, -1): expand the first dimension to size B, -1 tells pytorch to leave that dimension as is
+        if token_positions is None:
+            token_positions = torch.arange(S, device=x.device).unsqueeze(0).expand(B, -1)
+        # embed (B, S) -> (B, S, d_model)
+        token_emb = self.emb(x)
+        # apply transformer blocks
+        for layer_i in self.transformer_blocks:
+            token_emb = layer_i(token_emb, token_positions)
+        # apply layer norm
+        layernorm_output = self.rmsnorm(token_emb)
+        # linear projection to vocab size
+        logits = self.linear(layernorm_output)
+        # apply softmax
+        # return softmax(linear_output, i=-1)
+        return logits
+
+
+def cross_entropy_loss(inputs: torch.Tensor, targets: torch.Tensor):
+    # inputs: (B, C). targets: (B)
+    max_val = torch.max(inputs, dim=-1, keepdim=True).values
+    normalized_inputs = inputs - max_val
+    # true-class logits: (B, 1)
+    true_class_logit = torch.gather(normalized_inputs, dim=1, index=targets.unsqueeze(1))
+    # get the sum of logit
+    logit_sum = torch.log(torch.sum(torch.exp(normalized_inputs), keepdim=True, dim=1))
+    total_loss = logit_sum - true_class_logit
+    return torch.mean(total_loss)
+
+
+class SGD(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-3):
+        if lr < 0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        defaults = {"lr": lr}
+        super().__init__(params, defaults)
+
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        loss = None if closure is None else closure()
+        for group in self.param_groups:
+            lr = group["lr"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                t = state.get("t", 0)   # Get state associated with p
+                grad = p.grad.data  # Get the gradient of loss w.r.t. p
+                p.data -= lr / math.sqrt(t + 1) * grad  # Update weight tensor in place
+                state["t"] = t + 1  # Increment iteration number
+
+
+class AdamW(torch.optim.Optimizer):
+    def __init__(self, params, lr, betas, eps, weight_decay):
+        if lr < 0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        # A dictionary containing default values for the optimizer's hyperparameters
+        defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay}
+        super().__init__(params, defaults)
+
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        loss = None if closure is None else closure()
+        for group in self.param_groups:
+            lr = group["lr"]
+            weight_decay = group["weight_decay"]
+            eps = group["eps"]
+            beta1, beta2 = group["betas"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                # param update
+                grad = p.grad.data  # Get gradient of loss w.r.t p
+                # get state
+                state = self.state[p]
+                # initialize state on first use
+                t = state.get("t", 0)  # Get iteration number
+                m = state.get("m", torch.zeros_like(p))
+                v = state.get("v", torch.zeros_like(p))
+                t += 1
+                # compute adjusted lr for this iteration
+                lr_adjusted = lr * (np.sqrt(1-beta2**t) / (1-beta1**t))
+                # apply weight decay, distinct from parameter update
+                p.data = (1 - lr * weight_decay) * p.data
+                # Update first and second moment
+                m = beta1 * m + (1-beta1) * grad
+                v = beta2 * v + (1-beta2) * grad**2
+                # Update weight
+                p.data -= lr_adjusted * m / (torch.sqrt(v) + eps)
+                # Update state: iteration number, first and second moment
+                state["t"] = t
+                state["m"] = m
+                state["v"] = v
+
 
 # if __name__ == "__main__":
-#     d_k = 64
-#     max_seq_len = 512
-#     angles = rotate_angle(10000.0, d_k, max_seq_len)
-#     x = torch.rand(2, 6)
-#     print(x)
-#     print(get_half_seq(x))
+#     initial_weights = torch.nn.Parameter(5 * torch.randn((10,10)))
+#     learning_rates = [1]
+#     losses_by_lr = {}
+#     for lr in learning_rates:
+#         # Reset to identical starting weights
+#         weights = torch.nn.Parameter(initial_weights.clone())
+#         opt = AdamW([weights], lr=lr, beta1=0.9, beta2=0.999, eps=1e-4, weight_decay=1e-2)
+#         losses = []
+#         for t in range(100):
+#             opt.zero_grad()
+#             loss = (weights ** 2).mean()
+#             # Save scalar loss
+#             losses.append(loss.item())
+#             loss.backward() # Run backward pass
+#             opt.step()  # Run optimizer step
+#         losses_by_lr[lr] = losses
+#     # plot
+#     plt.figure(figsize=(10, 6))
+#     for lr, losses in losses_by_lr.items():
+#         plt.plot(range(100), losses, label=f"lr={lr}")
+#     plt.xlabel("Training step")
+#     plt.ylabel("Loss")
+#     plt.legend()
+#     plt.grid(True)
+#     plt.show()
