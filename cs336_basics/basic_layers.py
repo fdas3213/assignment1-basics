@@ -426,6 +426,65 @@ class AdamW(torch.optim.Optimizer):
                 state["v"] = v
 
 
+def cosine_annealing_scheduler(t: int, lr_max: float, lr_min: float, warmup_steps: int, total_steps: int) -> float:
+    if t < 0:
+        raise ValueError(f"Invalid iteration: {t}")
+    if t < warmup_steps:
+        return t / warmup_steps * lr_max
+    elif t >= warmup_steps and t <= total_steps:
+        return lr_min + 1/2 * (1 + np.cos((t - warmup_steps) / (total_steps - warmup_steps) * math.pi)) * (lr_max - lr_min)
+    else:
+        return lr_min
+
+
+def gradient_clipping(parameters: Iterable[nn.Parameter], max_l2_norm: float, eps: float = 1e-6):
+    # 1. Collect active gradients
+    grads = [p.grad.data for p in parameters if p.grad is not None]
+    if not grads:
+        return
+    # 2. Compute l2 norm
+    total_norm = torch.sqrt(sum(torch.linalg.norm(g) ** 2 for g in grads))
+    # 3. Scale gradients
+    if total_norm > max_l2_norm:
+        scale_factor = max_l2_norm / (total_norm + eps)
+        for g in grads:
+            g.mul_(scale_factor)
+
+
+if __name__ == "__main__":
+    lr_max = 1e-3
+    lr_min = 1e-6
+    warmup_steps = 10_000
+    total_steps = 100_000
+    lr_list = []
+    for t in range(total_steps):
+        lr = cosine_annealing_scheduler(t, lr_max, lr_min, warmup_steps, total_steps)
+        lr_list.append(lr)
+    plt.figure(figsize=(10,6))
+    plt.plot(range(total_steps), lr_list)
+    plt.xlabel("Training step")
+    plt.ylabel("Learning rate")
+    plt.grid(True)
+    plt.show()
+    # beta1 = 0.9
+    # beta2 = 0.99
+    # lr_list = []
+    # lr_init = 1e-3
+    # total_steps = 10000
+    # for t in range(1, total_steps, 1):
+    #     lr_adj = lr_init * (np.sqrt(1-beta2**t) / (1-beta1**t))
+    #     lr_list.append(lr_adj)
+    # plt.figure(figsize=(10,6))
+    # for lr in lr_list:
+    #     plt.plot(range(1, total_steps, 1), lr_list)
+    # plt.xlabel("Training step")
+    # plt.ylabel("Adjusted learning rate")
+    # plt.legend()
+    # plt.grid(True)
+    # plt.show()
+
+
+
 # if __name__ == "__main__":
 #     initial_weights = torch.nn.Parameter(5 * torch.randn((10,10)))
 #     learning_rates = [1]
