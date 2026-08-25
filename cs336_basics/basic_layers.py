@@ -1,9 +1,12 @@
 from collections.abc import Callable, Iterable
 from typing import Optional
 import numpy as np
+import numpy.typing as npt
 import math
 import torch
 import torch.nn as nn
+import os
+import typing
 import matplotlib.pyplot as plt
 
 
@@ -449,6 +452,55 @@ def gradient_clipping(parameters: Iterable[nn.Parameter], max_l2_norm: float, ep
         scale_factor = max_l2_norm / (total_norm + eps)
         for g in grads:
             g.mul_(scale_factor)
+
+
+def load_data(x: npt.NDArray, batch_size: int, context_length: int, device: str) -> (torch.Tensor, torch.Tensor):
+    total_len = x.shape[0]
+    data, label = [], []
+    # sample starting indices
+    start_indices = np.random.randint(
+        0,
+        total_len - context_length,
+        size=batch_size,
+    )
+    for i in start_indices:
+        input = x[i : i+context_length]
+        # target is shifted one position to the right
+        target = x[i+1 : i+context_length+1]
+        data.append(input)
+        label.append(target)
+       
+    inputs =  torch.tensor(np.array(data), dtype=torch.long, device=device)
+    targets = torch.tensor(np.array(label), dtype=torch.long, device=device)
+    return inputs, targets
+
+
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    out: str | os.PathLike | typing.BinaryIO | typing.IO[bytes]
+):
+    # Merge into a single nested dictionary
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "iteration": iteration
+    }
+    torch.save(checkpoint, out)
+    
+
+def load_checkpoint(
+    src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer
+):
+    ckpt = torch.load(src)
+    model.load_state_dict(ckpt["model_state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    iteration = ckpt["iteration"]
+    return iteration
+    
 
 
 if __name__ == "__main__":
